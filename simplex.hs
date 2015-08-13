@@ -3,18 +3,27 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 module Simplex where
+import Debug.Trace
 import Data.List
+import Data.Maybe
+import Data.Either
+import Control.Monad
 import qualified Data.Map as Map
 import Data.Vector (Vector)
 import qualified Data.Vector as Vec
+import Data.Matrix (Matrix)
+import qualified Data.Matrix as Mat
 
 newtype Poly a = P (Vector a)
+
+coefficients :: Poly a -> Vector a
+coefficients (P v) = v
 
 instance (Show a, Num a, Eq a) => Show (Poly a) where
   show (P cs) = intercalate " + " . filter (/= "") . map showTerm $ zip (Vec.toList cs) [0..]
     where showTerm :: (Show a, Num a, Eq a) => (a, Int) -> String
           showTerm (c, i)
-            -- | c == 0    = "" -- TODO use this line to hide terms with coefficient 0
+            -- | c == 0    = "" -- hide terms with coefficient 0
             | otherwise = show c ++ "(x_" ++ show i ++ ")"
 
 instance Num a => Num (Poly a) where
@@ -280,7 +289,153 @@ boundUnrestrictedVars (LP obj cs bvec)
                   (NNBound _) -> consB NonNeg $ boundUnrestrictedVars (LP obj cs bs)
                   (Unbound _) -> consB NonNeg $ boundUnrestrictedVars (LP obj cs . Vec.snoc bs $ NNBound NonNeg)
 
+----- LP Solving Functions
 
+data Assignment a = FullAssignment (Vector a) | PartialAssignment (Vector (Maybe a))
+                  deriving Show
+
+instance Functor Assignment where
+  fmap fn (FullAssignment vec) = FullAssignment $ Vec.map fn vec
+  fmap fn (PartialAssignment vec) = PartialAssignment $ Vec.map (fmap fn) vec
+
+data MaybeSolution a =
+  PartialSolution (Assignment a) (Vector (Eql a))
+  | Finished (Assignment a)
+  | Impossible String
+  | Underspecified String
+
+(<|) :: (Assignment a -> Vector (Eql a) -> MaybeSolution a) -> MaybeSolution a -> MaybeSolution a
+fn <| (PartialSolution assn eqls) = fn assn eqls
+_ <| Finished s = Finished s
+_ <| Impossible s = Impossible s
+_ <| Underspecified s = Underspecified s
+infixl 1 <|
+
+instance Show a => Show (MaybeSolution a) where
+  show (PartialSolution assn eqls) = show assn ++ "\n" ++ show (toMatrix eqls)
+  show (Finished assn) = show assn
+  show (Impossible s) = "Impossible: " ++ s
+  show (Underspecified s) = "Underspecified: " ++ s
+
+finish :: Assignment a -> MaybeSolution a
+finish a@(FullAssignment _) = Finished a
+finish a@(PartialAssignment vs)
+  | all isJust vs = Finished . FullAssignment $ Vec.map fromJust vs
+  | otherwise     = Finished a
+
+assignmentValues :: Assignment a -> Vector (Maybe a)
+assignmentValues (FullAssignment vec) = Vec.map Just vec
+assignmentValues (PartialAssignment vec) = vec
+
+emptyAssignment :: Matrix a -> Assignment a
+emptyAssignment = PartialAssignment . flip Vec.replicate Nothing . mNumVars
+
+hasNonzeroCoeffs :: (Num a, Eq a) => Int -> Poly a -> Bool
+hasNonzeroCoeffs n (P coeffs) = (== n) . Vec.length $ Vec.filter (/= 0) coeffs
+
+nonzeroCoeffs :: (Num a, Eq a) => Poly a -> [Int]
+nonzeroCoeffs (P coeffs) = map fst . filter ((/= 0) . snd) $ zip [1..] (Vec.toList coeffs)
+
+isZeroP :: (Num a, Eq a) => Poly a -> Bool
+isZeroP (P coeffs) = Vec.all (== 0) coeffs
+
+applyP :: Num a => Assignment a -> Poly a -> a
+applyP (PartialAssignment someValues) p = applyP (FullAssignment $ Vec.map (fromMaybe 0) someValues) p
+applyP (FullAssignment values) (P coeffs) = sum . map computeTerm $ zip (Vec.toList $ Vec.zip coeffs values) [0..]
+  where computeTerm ((c, v), e) = c * v
+--where computeTerm ((c, v), e) = c * v^e TODO clarify single variable vs multivar polynomials
+
+assign :: Num a => Assignment a -> Eql a -> Eql a
+assign (FullAssignment values) = assignAt . zip [1..] $ Vec.toList values
+assign (PartialAssignment values) = assignAt . mapMaybe (\(i, mv) -> case mv of
+                                                 Just v -> Just (i, v)
+                                                 Nothing -> Nothing
+                                                 ) $ zip [1..] (Vec.toList values)
+assignAt :: Num a => [(Int, a)] -> Eql a -> Eql a
+assignAt [] p = p
+assignAt ((n, v):rest) (Eql p@(P coeffs) k) = assignAt rest $ Eql (P $ coeffs Vec.// [(n-1, 0)]) (k + computedValue)
+  where computedValue = applyP (FullAssignment oneAssignment) p
+        oneAssignment = Vec.replicate (Vec.length coeffs) 0 Vec.// [(n-1, v)]
+
+toSystemOfLinearEquations :: Num a => LinearProgram Max Eql NonNeg a -> Vector (Eql a)
+toSystemOfLinearEquations lp = Vec.cons eqnFromObjective (constraints $ appendVar lp NonNeg)
+  where eqnFromObjective = Eql (pAppend (negate . poly $ objective lp) 1) 0
+
+toMatrix :: Vector (Eql a) -> Matrix a
+toMatrix = Mat.fromLists . map eqlToList . Vec.toList
+  where eqlToList (Eql (P vs) v) = Vec.toList vs ++ [v]
+
+toEqualities :: Num a => Matrix a -> Vector (Eql a)
+toEqualities = Vec.fromList . map listToEql . Mat.toLists
+  where listToEql [] = Eql (P Vec.empty) 0
+        listToEql vs = Eql (P . Vec.fromList $ init vs) (last vs)
+
+simplifyEquality :: (Num a, Eq a) => Assignment a -> Eql a -> Either Bool (Eql a)
+simplifyEquality assn e = resolveAssignment $ assign assn e
+  where resolveAssignment e'@(Eql p' c')
+          | isZeroP p'     = Left $ c' == 0
+          | otherwise      = Right $ Eql p' c'
+
+simplifyAllEqualities :: (Num a, Eq a) => Assignment a -> Vector (Eql a) -> Either Bool (Vector (Eql a))
+simplifyAllEqualities assn eqls = reassembleSimplified . partitionEithers . map (simplifyEquality assn) $ Vec.toList eqls
+  where reassembleSimplified :: ([Bool], [Eql a]) -> Either Bool (Vector (Eql a))
+        reassembleSimplified ([], []) = Left True
+        reassembleSimplified ([], eqs) = Right $ Vec.fromList eqs
+        reassembleSimplified (solutions, eqs)
+          | all (== True) solutions = reassembleSimplified ([], eqs)
+          | otherwise               = Left False
+
+mNumVars :: Matrix a -> Int
+mNumVars m = Mat.ncols m - 1
+
+-- A basic variable is a variable that shows up in exactly one equation.
+-- Returns a list of basic variables, ONE-INDEXED.
+-- Excludes the last column, since this is the "equalities" column and does not contain variable coefficients.
+basicVars :: (Num a, Eq a) => Matrix a -> [Int]
+basicVars m = filter (isBasic . flip Mat.getCol m)  $ take (mNumVars m) [1..]
+  where isBasic :: (Num a, Eq a) => Vector a -> Bool
+        isBasic col = length (Vec.filter (/= 0) col) == 1
+
+nonBasicVars :: (Num a, Eq a) => Matrix a -> [Int]
+nonBasicVars m = take (mNumVars m) [1..] \\ basicVars m
+
+-- Assign all non-basic variables to 0, leaving basic variables unassigned.
+nonBasicAssignment :: (Num a, Eq a) => Matrix a -> Assignment a
+nonBasicAssignment m = PartialAssignment $ Vec.replicate (mNumVars m) Nothing Vec.// map (\nth -> (nth - 1, Just 0)) (nonBasicVars m)
+
+basicSolution :: (Fractional a, Eq a) => Matrix a -> MaybeSolution a
+basicSolution m = solveForBasicVars (basicVars m) <| solve (nonBasicAssignment m) (toEqualities m)
+
+solve :: (Fractional a, Eq a) => Assignment a -> Vector (Eql a) -> MaybeSolution a
+solve assn eqls = toSolution assn (simplifyAllEqualities assn eqls)
+
+toSolution :: Assignment a -> Either Bool (Vector (Eql a)) -> MaybeSolution a
+toSolution assn (Left True) = Finished assn
+toSolution _ (Left False)   = Impossible "toSolution :: simplifyAll failed"
+toSolution assn (Right vec) = PartialSolution assn vec
+
+solveForBasicVars :: (Fractional a, Eq a) => [Int] -> Assignment a -> Vector (Eql a) -> MaybeSolution a
+solveForBasicVars [] assn _ = finish assn
+solveForBasicVars basics assn eqls = case popBasic basics eqls of
+                                      Nothing -> Underspecified "No isolated basic variables left"
+                                      Just (b, bs) -> solveForBasicVars bs <| solveBasic b assn eqls
+
+popBasic :: (Num a, Eq a) => [Int] -> Vector (Eql a) -> Maybe (Int, [Int])
+popBasic bs eqls = (\(b:_) -> Just (b, delete b bs)) =<< find (\cs -> length cs == 1) (map (\(Eql p _) -> nonzeroCoeffs p) (Vec.toList eqls))
+
+solveBasic :: (Fractional a, Eq a) => Int -> Assignment a -> Vector (Eql a) -> MaybeSolution a
+solveBasic nth assn eqls = packSolved nth assn eqls $ solveAt nth =<< Vec.find (\(Eql cs _) -> coefficients cs Vec.! (nth - 1) /= 0) eqls
+
+packSolved :: (Num a, Eq a) => Int -> Assignment a -> Vector (Eql a) -> Maybe a -> MaybeSolution a
+packSolved _ _ _ Nothing = Underspecified "solveBasic nth failed to find equality containing variable"
+packSolved nth (PartialAssignment vals) eqls (Just newVal) = PartialSolution (PartialAssignment $ vals Vec.// [(nth - 1, Just newVal)]) (Vec.map (assignAt [(nth, newVal)]) eqls)
+
+solveAt :: (Fractional a, Eq a) => Int -> Eql a -> Maybe a
+solveAt nth (Eql (P cs) k)
+  | k == 0       = Just 0
+  | coeffAt == 0 = Just 0
+  | otherwise    = Just $ k / coeffAt
+      where coeffAt = cs Vec.! (nth - 1)
 
 
 main :: IO ()
@@ -290,14 +445,29 @@ main = do
                                   geq [-1, 2] 2
                               ]) (Vec.fromList [urs, ge0, ge0])
   print lp
-  print $ standardForm lp
-  where mkP :: [Int] -> Poly Int
+  let slp = standardForm lp
+  print slp
+
+  let slp2 = standardForm $ LP (lpMax [1, 1]) (Vec.fromList [
+                                  leq [2, 1] 4,
+                                  leq [1, 2] 3
+                                  ]) (Vec.fromList [ge0, ge0])
+
+  print slp2
+  let les = toSystemOfLinearEquations slp2
+  putStrLn . unlines . map show $ Vec.toList les
+  let mat = toMatrix les
+  print mat
+  print $ basicSolution mat
+  where mkP :: [Float] -> Poly Float
         mkP is = P $ Vec.fromList is
-        lpMin :: [Int] -> Objective Int
+        lpMax :: [Float] -> Objective Float
+        lpMax = OMax . Max . mkP
+        lpMin :: [Float] -> Objective Float
         lpMin = OMin . Min . mkP
-        leq :: [Int] -> Int -> Constraint Int
+        leq :: [Float] -> Float -> Constraint Float
         leq cs v  = LEC $ Leql (mkP cs) v
-        geq :: [Int] -> Int -> Constraint Int
+        geq :: [Float] -> Float -> Constraint Float
         geq cs v = GEC $ Geql (mkP cs) v
         urs = Unbound URS
         ge0 = NNBound NonNeg
